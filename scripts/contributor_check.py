@@ -213,7 +213,14 @@ def check_profile(username: str) -> list[Signal]:
 
 _DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\]\)]+")
 _CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}")
-_REPO_RE = re.compile(r"github\.com/([\w.-]+/[\w.-]+)")
+# `github.com/` must start a host: a preceding word char, dot or dash means a subdomain
+# such as docs.github.com/en/github (GitHub's docs, not a repository).
+_REPO_RE = re.compile(r"(?<![\w.-])github\.com/([\w.-]+/[\w.-]+)")
+
+
+def is_bot_login(username: str) -> bool:
+    """GitHub App accounts (dependabot[bot], github-actions[bot], ...)."""
+    return username.lower().endswith("[bot]")
 
 
 def _check_doi(doi: str, comment_date: datetime) -> Signal:
@@ -257,8 +264,12 @@ def _check_repo_claim(repo_path: str, comment_date: datetime) -> Signal:
     return Signal("repo_claim", "LOW", f"Repo {repo_path} con {age_at_comment} días de historia previa")
 
 
-def check_credentials(body: str, comment_date: datetime) -> list[Signal]:
+def check_credentials(body: str, comment_date: datetime, *, is_bot: bool = False) -> list[Signal]:
     signals: list[Signal] = []
+    if is_bot:
+        # Bot-authored PRs (Dependabot release notes, changelogs) quote many links and
+        # are not credential claims by a person; repo/DOI/CVE citations are not evaluated.
+        return signals
 
     dois = set(_DOI_RE.findall(body))
     for doi in list(dois)[:3]:  # cap to avoid API hammering on adversarial input
@@ -322,7 +333,9 @@ def main() -> None:
 
     report = Report(username=args.username)
     report.profile_signals = check_profile(args.username)
-    report.credential_signals = check_credentials(body, datetime.now(timezone.utc))
+    report.credential_signals = check_credentials(
+        body, datetime.now(timezone.utc), is_bot=is_bot_login(args.username)
+    )
 
     if args.json:
         print(json.dumps({
